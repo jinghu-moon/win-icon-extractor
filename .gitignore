@@ -1,0 +1,12 @@
+/target
+/test_output
+/aida64_icon.png
+/aida64_icon.webp
+/aida64_png_base64.txt
+/aida64_webp_base64.txt
+/loopback_initial.png
+/loopback_initial.webp
+/loopback_restored.png
+/loopback_restored.webp
+/AIDA64-Extreme-v7.00-Lite.exe
+/Cargo.lock

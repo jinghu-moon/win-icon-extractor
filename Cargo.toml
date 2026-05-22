@@ -1,0 +1,60 @@
+[package]
+name = "win-icon-extractor"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Extract file icons on Windows — pure Rust, no C dependency"
+license = "AGPL-3.0-only"
+repository = "https://github.com/jinghu-moon/win-icon-extractor"
+readme = "README.md"
+exclude = ["test_output/"]
+keywords = ["windows", "icon", "extract", "webp", "png"]
+categories = ["os::windows-apis", "multimedia::images"]
+
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
+targets = ["x86_64-pc-windows-msvc"]
+
+[features]
+default = ["webp", "cache", "bulk"]
+webp = ["dep:libwebp-sys"]
+png = ["dep:miniz_oxide"]
+cache = ["dep:dashmap", "dep:xxhash-rust"]
+bulk = ["dep:rayon"]
+
+[dependencies]
+thiserror = "2"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+  "Win32_Foundation",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_Graphics_Gdi",
+  "Win32_Storage_FileSystem",
+  "Win32_System_LibraryLoader",
+]
+
+[dependencies.libwebp-sys]
+version = "0.9"
+optional = true
+
+[dependencies.dashmap]
+version = "6"
+optional = true
+
+[dependencies.xxhash-rust]
+version = "0.8"
+features = ["xxh3"]
+optional = true
+
+[dependencies.rayon]
+version = "1"
+optional = true
+
+[dependencies.miniz_oxide]
+version = "0.8"
+optional = true
+
+[workspace]
