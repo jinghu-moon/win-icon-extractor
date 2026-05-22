@@ -7,6 +7,7 @@ Extract file icons on Windows — pure Rust, no C dependency.
 - **System stock icons** — folder, drive, recycle bin, shield, etc.
 - **Icon enumeration** — query how many icons a PE file contains
 - **WebP / PNG encoding** with configurable options
+- **Base64 encoding & decoding** — extract as Base64 Data URL, and decode back with format auto-detection
 - **Disk + memory cache** with mtime-based staleness detection
 - **Bulk parallel extraction** via rayon
 
@@ -129,6 +130,26 @@ for (path, result) in &results {
 // Maintenance
 let stats = cache.stats().unwrap();
 cache.cleanup(30).unwrap(); // remove files older than 30 days
+```
+
+## Base64 Support
+
+You can extract icons directly into Base64 encoded strings (useful for web display as Data URLs) or decode them back into binary image files:
+
+```rust
+use win_icon_extractor::*;
+
+// Extract directly to WebP/PNG Base64 (Data URL ready)
+let webp_base64 = extract_icon_webp_base64(r"C:\Windows\explorer.exe").unwrap();
+let png_base64 = extract_icon_png_base64(r"C:\Windows\explorer.exe").unwrap();
+
+// Standard Base64 encode
+let base64_str = encode_base64(&raw_image_bytes);
+
+// Decode back with adaptive format detection (supports pure Base64 or Data URLs)
+let data_url = format!("data:image/webp;base64,{}", webp_base64);
+let (decoded_bytes, format) = decode_image_base64(&data_url).unwrap();
+assert_eq!(format, "webp");
 ```
 
 ## Features

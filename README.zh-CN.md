@@ -7,6 +7,7 @@ Windows 文件图标提取库 — 纯 Rust 实现，无 C 依赖。
 - **系统预定义图标** — 文件夹、驱动器、回收站、盾牌等
 - **图标枚举** — 查询 PE 文件包含的图标数量
 - **WebP / PNG 编码** — 可配置选项
+- **Base64 编解码** — 支持直接提取为 Base64 Data URL，并能通过自适应格式检测（PNG/WebP）将其解码还原
 - **磁盘 + 内存缓存** — 基于 mtime 的过期检测
 - **批量并行提取** — 基于 rayon
 
@@ -129,6 +130,26 @@ for (path, result) in &results {
 // 维护
 let stats = cache.stats().unwrap();
 cache.cleanup(30).unwrap(); // 清理 30 天前的缓存文件
+```
+
+## Base64 支持
+
+支持直接将提取的图标转换为 Base64 编码字符串（非常适用于前端作为 Data URL 展示），同时也支持将其还原解码为二进制图像数据：
+
+```rust
+use win_icon_extractor::*;
+
+// 直接提取为 WebP/PNG 的 Base64（已包含常见头部，可直接用于前端展示）
+let webp_base64 = extract_icon_webp_base64(r"C:\Windows\explorer.exe").unwrap();
+let png_base64 = extract_icon_png_base64(r"C:\Windows\explorer.exe").unwrap();
+
+// 通用 Base64 编码
+let base64_str = encode_base64(&raw_image_bytes);
+
+// 解码还原并自适应格式识别（支持纯 Base64 或带头部的 Data URL）
+let data_url = format!("data:image/webp;base64,{}", webp_base64);
+let (decoded_bytes, format) = decode_image_base64(&data_url).unwrap();
+assert_eq!(format, "webp");
 ```
 
 ## Features
