@@ -1,6 +1,6 @@
 [package]
 name = "win-icon-extractor"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.70"
 description = "Extract file icons on Windows — pure Rust, no C dependency"
@@ -10,23 +10,28 @@ readme = "README.md"
 exclude = ["test_output/"]
 keywords = ["windows", "icon", "extract", "webp", "png"]
 categories = ["os::windows-apis", "multimedia::images"]
+authors = ["jinghu-moon <jinghu-moon@users.noreply.github.com>"]
 
 [package.metadata.docs.rs]
 default-target = "x86_64-pc-windows-msvc"
 targets = ["x86_64-pc-windows-msvc"]
 
 [features]
-default = ["webp", "cache", "bulk"]
-webp = ["dep:libwebp-sys"]
+default = ["webp", "cache", "bulk", "resize"]
+# Pure-Rust lossless WebP (image-webp) — no C dependency
+webp = ["dep:image-webp"]
+# Optional libwebp (C) for lossy encoding / full WebPConfig control
+webp-libwebp = ["webp", "dep:libwebp-sys"]
 png = ["dep:miniz_oxide"]
 cache = ["dep:dashmap", "dep:xxhash-rust"]
 bulk = ["dep:rayon"]
+resize = ["dep:resize"]
 
 [dependencies]
 thiserror = "2"
 
 [dependencies.windows]
-version = "0.58"
+version = "0.61"
 features = [
   "Win32_Foundation",
   "Win32_UI_Shell",
@@ -38,6 +43,10 @@ features = [
 
 [dependencies.libwebp-sys]
 version = "0.9"
+optional = true
+
+[dependencies.image-webp]
+version = "0.2"
 optional = true
 
 [dependencies.dashmap]
@@ -57,4 +66,39 @@ optional = true
 version = "0.8"
 optional = true
 
-[workspace]
+[dependencies.resize]
+version = "0.8"
+optional = true
+default-features = false
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "extract"
+harness = false
+
+# Examples require the features they demonstrate.
+[[example]]
+name = "test_new_api"
+required-features = ["webp", "png", "resize"]
+
+[[example]]
+name = "compare_resize"
+required-features = ["png", "resize"]
+
+[[example]]
+name = "export_webp32"
+required-features = ["webp", "resize"]
+
+[[example]]
+name = "bench"
+required-features = ["cache", "bulk", "webp"]
+
+[[example]]
+name = "bench_new_api"
+required-features = ["cache", "webp"]
+
+[[example]]
+name = "bench_real"
+required-features = ["cache", "bulk", "webp", "resize"]

@@ -11,7 +11,11 @@ const fn make_crc_table() -> [u32; 256] {
         let mut c = n;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 { 0xEDB88320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB88320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         table[n as usize] = c;
@@ -61,14 +65,20 @@ pub struct PngOptions {
 
 impl Default for PngOptions {
     fn default() -> Self {
-        Self { filter: PngFilter::None, compression_level: 6 }
+        Self {
+            filter: PngFilter::None,
+            compression_level: 6,
+        }
     }
 }
 
 impl PngOptions {
     /// Best visual quality preset: max compression, no filter (optimal for icons).
     pub fn best_quality() -> Self {
-        Self { filter: PngFilter::None, compression_level: 10 }
+        Self {
+            filter: PngFilter::None,
+            compression_level: 10,
+        }
     }
 }
 
@@ -79,12 +89,16 @@ pub fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, IconE
 
 /// Encode RGBA pixels to PNG with custom options.
 pub fn encode_png_with(
-    rgba: &[u8], width: u32, height: u32, opts: &PngOptions,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    opts: &PngOptions,
 ) -> Result<Vec<u8>, IconError> {
     let expected = (width as usize) * (height as usize) * 4;
     if rgba.len() != expected {
         return Err(IconError::Encode(format!(
-            "RGBA buffer size mismatch: expected {expected}, got {}", rgba.len()
+            "RGBA buffer size mismatch: expected {expected}, got {}",
+            rgba.len()
         )));
     }
 
@@ -97,8 +111,8 @@ pub fn encode_png_with(
     let mut ihdr = [0u8; 13];
     ihdr[0..4].copy_from_slice(&width.to_be_bytes());
     ihdr[4..8].copy_from_slice(&height.to_be_bytes());
-    ihdr[8] = 8;  // bit depth
-    ihdr[9] = 6;  // color type: RGBA
+    ihdr[8] = 8; // bit depth
+    ihdr[9] = 6; // color type: RGBA
     write_chunk(&mut out, b"IHDR", &ihdr);
 
     // IDAT: filtered row data, zlib compressed
@@ -129,4 +143,44 @@ pub fn encode_png_with(
     write_chunk(&mut out, b"IEND", &[]);
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn solid_rgba(w: u32, h: u32, r: u8, g: u8, b: u8, a: u8) -> Vec<u8> {
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..(w * h) {
+            v.extend_from_slice(&[r, g, b, a]);
+        }
+        v
+    }
+
+    #[test]
+    fn png_signature_and_chunks() {
+        let rgba = solid_rgba(4, 4, 255, 0, 0, 255);
+        let png = encode_png(&rgba, 4, 4).unwrap();
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        assert!(png.windows(4).any(|w| w == b"IHDR"));
+        assert!(png.windows(4).any(|w| w == b"IDAT"));
+        assert!(png.windows(4).any(|w| w == b"IEND"));
+    }
+
+    #[test]
+    fn png_rejects_bad_buffer() {
+        let rgba = vec![0u8; 10];
+        assert!(encode_png(&rgba, 4, 4).is_err());
+    }
+
+    #[test]
+    fn png_filter_sub_encodes() {
+        let rgba = solid_rgba(2, 2, 10, 20, 30, 40);
+        let png = encode_png_with(&rgba, 2, 2, &PngOptions {
+            filter: PngFilter::Sub,
+            compression_level: 6,
+        })
+        .unwrap();
+        assert!(png.len() > 50);
+    }
 }

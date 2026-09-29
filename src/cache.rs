@@ -2,37 +2,40 @@
 
 use crate::error::IconError;
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use xxhash_rust::xxh3::xxh3_64;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use xxhash_rust::xxh3::Xxh3;
 
 /// Icon cache with configurable directory and memory layer.
 pub struct IconCache {
     dir: PathBuf,
-    /// Memory cache: path → (cache_file, mtime_secs) for staleness detection
-    mem: DashMap<String, (PathBuf, u64)>,
+    /// Memory cache: source path → entry (validates via mtime with TTL)
+    mem: DashMap<PathBuf, CacheEntry>,
     /// Per-key locks to prevent concurrent duplicate extraction
-    locks: DashMap<String, Arc<Mutex<()>>>,
+    locks: DashMap<PathBuf, Arc<Mutex<()>>>,
     #[cfg(any(feature = "webp", feature = "png"))]
     format: ImageFormat,
     #[cfg(feature = "webp")]
     webp_opts: crate::encode::WebPOptions,
     #[cfg(feature = "png")]
     png_opts: crate::png::PngOptions,
+    /// Skip fs::mtime while an entry is younger than this (hot path).
+    mtime_ttl: Duration,
 }
 
-/// Get file mtime as seconds since epoch (0 if unavailable).
-#[inline]
-fn file_mtime_secs(path: &str) -> u64 {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
-        .unwrap_or(0)
+#[derive(Clone)]
+struct CacheEntry {
+    file: PathBuf,
+    mtime: u64,
+    /// When we last confirmed `mtime` against the filesystem.
+    validated_at: Instant,
 }
 
 /// Cache statistics.
+#[derive(Debug, Clone)]
 pub struct CacheStats {
     pub total_files: usize,
     pub total_size: u64,
@@ -41,7 +44,7 @@ pub struct CacheStats {
 
 /// Output image format for cached icon files.
 #[cfg(any(feature = "webp", feature = "png"))]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageFormat {
     #[cfg(feature = "webp")]
     Webp,
@@ -49,23 +52,62 @@ pub enum ImageFormat {
     Png,
 }
 
-impl IconCache {
-    /// Create a cache with the given directory (created if missing).
-    pub fn new(dir: PathBuf) -> Result<Self, IconError> {
-        if !dir.exists() {
-            fs::create_dir_all(&dir)?;
+/// Get file mtime as seconds since epoch (0 if unavailable).
+#[inline]
+fn file_mtime_secs(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
+        .unwrap_or(0)
+}
+
+// ── Extension icon process cache ──
+
+type ExtCacheMap = Mutex<HashMap<(String, u32), Arc<IconData>>>;
+
+fn ext_icon_cache() -> &'static ExtCacheMap {
+    static CACHE: OnceLock<ExtCacheMap> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Extract (and memoize) the associated icon for an extension at a given size.
+/// Size 0 = system large icon. Shared across the whole process.
+pub fn extract_icon_for_extension_cached(ext: &str, size: u32) -> Result<IconData, IconError> {
+    let key = ext.to_ascii_lowercase();
+    let size_key = size.min(256);
+    {
+        let map = ext_icon_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(data) = map.get(&(key.clone(), size_key)) {
+            return Ok((**data).clone());
         }
-        Ok(Self {
-            dir,
-            mem: DashMap::new(),
-            locks: DashMap::new(),
+    }
+    let data = crate::extract::extract_icon_for_extension_sized(ext, size)?;
+    let mut map = ext_icon_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let arc = Arc::new(data);
+    map.insert((key, size_key), arc.clone());
+    Ok((*arc).clone())
+}
+
+type IconData = crate::extract::IconData;
+
+impl IconCache {
+    /// Start a builder rooted at `dir`.
+    pub fn builder(dir: impl Into<PathBuf>) -> IconCacheBuilder {
+        IconCacheBuilder {
+            dir: dir.into(),
             #[cfg(any(feature = "webp", feature = "png"))]
             format: Self::default_format(),
             #[cfg(feature = "webp")]
             webp_opts: Default::default(),
             #[cfg(feature = "png")]
             png_opts: Default::default(),
-        })
+            mtime_ttl: Duration::from_secs(5),
+        }
+    }
+
+    /// Create a cache with the given directory (created if missing).
+    pub fn new(dir: PathBuf) -> Result<Self, IconError> {
+        Self::builder(dir).build()
     }
 
     /// Default cache under `%LOCALAPPDATA%/<app_name>/icon_cache`.
@@ -94,12 +136,21 @@ impl IconCache {
         self.format = format;
     }
 
+    /// How long a memory-cache entry is trusted without an `fs::metadata` revalidation.
+    pub fn set_mtime_ttl(&mut self, ttl: Duration) {
+        self.mtime_ttl = ttl;
+    }
+
     #[cfg(any(feature = "webp", feature = "png"))]
     fn default_format() -> ImageFormat {
         #[cfg(feature = "webp")]
-        { ImageFormat::Webp }
+        {
+            ImageFormat::Webp
+        }
         #[cfg(all(not(feature = "webp"), feature = "png"))]
-        { ImageFormat::Png }
+        {
+            ImageFormat::Png
+        }
     }
 
     /// Cache directory path.
@@ -107,40 +158,127 @@ impl IconCache {
         &self.dir
     }
 
-    /// Cache key: hash combining path + mtime.
-    fn cache_key(path: &str, mtime_secs: u64) -> String {
-        let h = xxh3_64(path.as_bytes()) ^ mtime_secs.wrapping_mul(0x9E3779B97F4A7C15);
-        format!("{:016x}", h)
+    /// Stable digest of the active encode settings (included in the file name).
+    fn opts_digest(&self) -> u64 {
+        let mut h = Xxh3::new();
+        #[cfg(feature = "webp")]
+        {
+            if matches!(self.format, ImageFormat::Webp) {
+                h.update(b"webp");
+                h.update(&self.webp_opts.quality.to_bits().to_le_bytes());
+                h.update(&self.webp_opts.method.to_le_bytes());
+                h.update(&[self.webp_opts.lossless as u8, self.webp_opts.exact as u8]);
+                h.update(&self.webp_opts.alpha_quality.to_le_bytes());
+            }
+        }
+        #[cfg(feature = "png")]
+        {
+            if matches!(self.format, ImageFormat::Png) {
+                h.update(b"png");
+                h.update(&[self.png_opts.compression_level]);
+                h.update(&[self.png_opts.filter as u8]);
+            }
+        }
+        #[cfg(feature = "webp")]
+        {
+            if matches!(self.format, ImageFormat::Webp) {
+                return h.digest();
+            }
+        }
+        #[cfg(feature = "png")]
+        {
+            if matches!(self.format, ImageFormat::Png) {
+                return h.digest();
+            }
+        }
+        #[allow(unreachable_code)]
+        h.digest()
+    }
+
+    /// Cache key: hash of path + mtime + size + format + encode options.
+    fn cache_key(
+        path: &Path,
+        mtime_secs: u64,
+        size: u32,
+        format_tag: u8,
+        opts_hash: u64,
+    ) -> String {
+        let mut h = Xxh3::new();
+        h.update(path.to_string_lossy().as_bytes());
+        h.update(&mtime_secs.to_le_bytes());
+        h.update(&size.to_le_bytes());
+        h.update(&[format_tag]);
+        h.update(&opts_hash.to_le_bytes());
+        format!("{:016x}", h.digest())
+    }
+
+    #[cfg(any(feature = "webp", feature = "png"))]
+    fn format_tag_and_ext(&self) -> (u8, &'static str) {
+        match self.format {
+            #[cfg(feature = "webp")]
+            ImageFormat::Webp => (1, "webp"),
+            #[cfg(feature = "png")]
+            ImageFormat::Png => (2, "png"),
+        }
     }
 
     /// Look up or extract+encode, returning the cached file path.
-    /// Thread-safe: per-key lock prevents duplicate extraction.
+    ///
+    /// Hot path (memory hit within `mtime_ttl`) does no filesystem work.
     #[cfg(any(feature = "webp", feature = "png"))]
-    pub fn extract_to_file(&self, path: &str) -> Result<PathBuf, IconError> {
+    pub fn extract_to_file(&self, path: impl AsRef<Path>) -> Result<PathBuf, IconError> {
+        self.extract_to_file_sized(path, 0)
+    }
+
+    /// Like [`extract_to_file`](Self::extract_to_file) but selects a target size
+    /// (0 = default/largest). The size participates in the cache key.
+    #[cfg(any(feature = "webp", feature = "png"))]
+    pub fn extract_to_file_sized(
+        &self,
+        path: impl AsRef<Path>,
+        size: u32,
+    ) -> Result<PathBuf, IconError> {
+        let path = path.as_ref();
+        let size = size.min(256);
+
+        // Fast path: fresh memory hit — no stat.
+        if let Some(entry) = self.mem.get(path) {
+            if entry.validated_at.elapsed() < self.mtime_ttl {
+                return Ok(entry.file.clone());
+            }
+        }
+
         let mtime = file_mtime_secs(path);
 
-        // Fast path: memory cache hit with mtime validation
+        // Memory hit with mtime check (slow path / TTL expired).
         if let Some(entry) = self.mem.get(path) {
-            let (cached_path, cached_mtime) = entry.value();
-            if *cached_mtime == mtime {
-                return Ok(cached_path.clone());
+            let entry = entry.value();
+            if entry.mtime == mtime {
+                // refresh TTL
+                self.mem.insert(
+                    path.to_path_buf(),
+                    CacheEntry {
+                        file: entry.file.clone(),
+                        mtime,
+                        validated_at: Instant::now(),
+                    },
+                );
+                return Ok(entry.file.clone());
             }
         }
 
         // Acquire per-key lock (double-checked locking)
-        let lock = self.locks
-            .entry(path.to_string())
+        let lock = self
+            .locks
+            .entry(path.to_path_buf())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
         let lock_for_cleanup = lock.clone();
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Ensure lock cleanup on all exit paths (including ? early returns)
-        // Only remove from map if no other thread is waiting (strong_count <= 3: map + lock + cleanup)
-        let locks_ref = &self.locks;
         struct LockCleanup<'a> {
-            locks: &'a DashMap<String, Arc<Mutex<()>>>,
-            key: &'a str,
+            locks: &'a DashMap<PathBuf, Arc<Mutex<()>>>,
+            key: &'a Path,
             arc: Arc<Mutex<()>>,
         }
         impl Drop for LockCleanup<'_> {
@@ -150,67 +288,97 @@ impl IconCache {
                 }
             }
         }
-        let _cleanup = LockCleanup { locks: locks_ref, key: path, arc: lock_for_cleanup };
+        let _cleanup = LockCleanup {
+            locks: &self.locks,
+            key: path,
+            arc: lock_for_cleanup,
+        };
 
-        // Re-check after lock (with mtime)
+        // Re-check after lock (fresh hit within TTL).
         if let Some(entry) = self.mem.get(path) {
-            let (cached_path, cached_mtime) = entry.value();
-            if *cached_mtime == mtime {
-                return Ok(cached_path.clone());
+            let e = entry.value();
+            if e.validated_at.elapsed() < self.mtime_ttl || e.mtime == mtime {
+                let file = e.file.clone();
+                drop(entry);
+                self.mem.insert(
+                    path.to_path_buf(),
+                    CacheEntry {
+                        file: file.clone(),
+                        mtime,
+                        validated_at: Instant::now(),
+                    },
+                );
+                return Ok(file);
             }
         }
 
-        let ext = self.format_ext();
-        let file = self.dir.join(format!("{}.{ext}", Self::cache_key(path, mtime)));
+        let (fmt_tag, ext) = self.format_tag_and_ext();
+        let opts_hash = self.opts_digest();
+        let file = self.dir.join(format!(
+            "{}.{ext}",
+            Self::cache_key(path, mtime, size, fmt_tag, opts_hash)
+        ));
 
         // Disk cache hit
         if file.exists() {
-            self.mem.insert(path.to_string(), (file.clone(), mtime));
+            self.mem.insert(
+                path.to_path_buf(),
+                CacheEntry {
+                    file: file.clone(),
+                    mtime,
+                    validated_at: Instant::now(),
+                },
+            );
             return Ok(file);
         }
 
         // Extract → encode → write
-        let data = crate::extract::extract_icon(path)?;
+        let data = if size > 0 {
+            crate::extract::extract_icon_with_size(path, size)?
+        } else {
+            crate::extract::extract_icon(path)?
+        };
         let bytes = self.encode_icon(&data)?;
         fs::write(&file, &bytes)?;
-        self.mem.insert(path.to_string(), (file.clone(), mtime));
+        self.mem.insert(
+            path.to_path_buf(),
+            CacheEntry {
+                file: file.clone(),
+                mtime,
+                validated_at: Instant::now(),
+            },
+        );
         Ok(file)
     }
 
     #[cfg(any(feature = "webp", feature = "png"))]
-    fn format_ext(&self) -> &'static str {
-        match self.format {
-            #[cfg(feature = "webp")]
-            ImageFormat::Webp => "webp",
-            #[cfg(feature = "png")]
-            ImageFormat::Png => "png",
-        }
-    }
-
-    #[cfg(any(feature = "webp", feature = "png"))]
-    fn encode_icon(&self, data: &crate::extract::IconData) -> Result<Vec<u8>, IconError> {
+    fn encode_icon(&self, data: &IconData) -> Result<Vec<u8>, IconError> {
         match self.format {
             #[cfg(feature = "webp")]
             ImageFormat::Webp => crate::encode::encode_webp_with(
-                &data.rgba, data.width, data.height, &self.webp_opts,
+                &data.rgba,
+                data.width,
+                data.height,
+                &self.webp_opts,
             ),
             #[cfg(feature = "png")]
-            ImageFormat::Png => crate::png::encode_png_with(
-                &data.rgba, data.width, data.height, &self.png_opts,
-            ),
+            ImageFormat::Png => {
+                crate::png::encode_png_with(&data.rgba, data.width, data.height, &self.png_opts)
+            }
         }
     }
 
     /// Bulk extract with caching + parallel execution.
+    /// Results are returned in **input order**.
     #[cfg(all(any(feature = "webp", feature = "png"), feature = "bulk"))]
     pub fn extract_to_file_bulk(
         &self,
         paths: &[&str],
-    ) -> std::collections::HashMap<String, Result<PathBuf, IconError>> {
+    ) -> Vec<(String, Result<PathBuf, IconError>)> {
         use rayon::prelude::*;
         paths
             .par_iter()
-            .map(|&p| (p.to_string(), self.extract_to_file(p)))
+            .map(|p| (p.to_string(), self.extract_to_file(*p)))
             .collect()
     }
 
@@ -248,5 +416,61 @@ impl IconCache {
         }
         self.clear_memory();
         Ok(())
+    }
+}
+
+/// Builder for [`IconCache`].
+pub struct IconCacheBuilder {
+    dir: PathBuf,
+    #[cfg(any(feature = "webp", feature = "png"))]
+    format: ImageFormat,
+    #[cfg(feature = "webp")]
+    webp_opts: crate::encode::WebPOptions,
+    #[cfg(feature = "png")]
+    png_opts: crate::png::PngOptions,
+    mtime_ttl: Duration,
+}
+
+impl IconCacheBuilder {
+    #[cfg(any(feature = "webp", feature = "png"))]
+    pub fn format(mut self, format: ImageFormat) -> Self {
+        self.format = format;
+        self
+    }
+
+    #[cfg(feature = "webp")]
+    pub fn webp_options(mut self, opts: crate::encode::WebPOptions) -> Self {
+        self.webp_opts = opts;
+        self
+    }
+
+    #[cfg(feature = "png")]
+    pub fn png_options(mut self, opts: crate::png::PngOptions) -> Self {
+        self.png_opts = opts;
+        self
+    }
+
+    /// Trust memory-cache entries for this long before revalidating mtime.
+    pub fn mtime_ttl(mut self, ttl: Duration) -> Self {
+        self.mtime_ttl = ttl;
+        self
+    }
+
+    pub fn build(self) -> Result<IconCache, IconError> {
+        if !self.dir.exists() {
+            fs::create_dir_all(&self.dir)?;
+        }
+        Ok(IconCache {
+            dir: self.dir,
+            mem: DashMap::new(),
+            locks: DashMap::new(),
+            #[cfg(any(feature = "webp", feature = "png"))]
+            format: self.format,
+            #[cfg(feature = "webp")]
+            webp_opts: self.webp_opts,
+            #[cfg(feature = "png")]
+            png_opts: self.png_opts,
+            mtime_ttl: self.mtime_ttl,
+        })
     }
 }

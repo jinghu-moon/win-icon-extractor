@@ -2,10 +2,12 @@
 
 use crate::error::IconError;
 use crate::extract::{AutoIcon, IconData};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use windows::Win32::UI::Shell::*;
 
 /// System-defined stock icon identifiers.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StockIcon {
     DocNoAssoc,
     DocAssoc,
@@ -50,29 +52,82 @@ pub enum StockIcon {
 impl StockIcon {
     fn as_i32(self) -> i32 {
         match self {
-            Self::DocNoAssoc => 0, Self::DocAssoc => 1, Self::Application => 2,
-            Self::Folder => 3, Self::FolderOpen => 4, Self::DriveRemovable => 7,
-            Self::DriveFixed => 8, Self::DriveNet => 9, Self::DriveNetDisabled => 10,
-            Self::DriveCd => 11, Self::DriveRam => 12, Self::World => 13,
-            Self::Server => 15, Self::Printer => 16, Self::MyNetwork => 17,
-            Self::Find => 22, Self::Help => 23, Self::Share => 28, Self::Link => 29,
-            Self::Recycler => 31, Self::RecyclerFull => 32, Self::Lock => 47,
-            Self::DriveUnknown => 58, Self::DriveDvd => 59, Self::Shield => 77,
-            Self::Warning => 78, Self::Info => 79, Self::Error => 80, Self::Key => 81,
-            Self::Software => 82, Self::DesktopPc => 94, Self::MobilePc => 95,
-            Self::Users => 96, Self::Internet => 104, Self::ZipFile => 105,
-            Self::Settings => 106, Self::Custom(v) => v,
+            Self::DocNoAssoc => 0,
+            Self::DocAssoc => 1,
+            Self::Application => 2,
+            Self::Folder => 3,
+            Self::FolderOpen => 4,
+            Self::DriveRemovable => 7,
+            Self::DriveFixed => 8,
+            Self::DriveNet => 9,
+            Self::DriveNetDisabled => 10,
+            Self::DriveCd => 11,
+            Self::DriveRam => 12,
+            Self::World => 13,
+            Self::Server => 15,
+            Self::Printer => 16,
+            Self::MyNetwork => 17,
+            Self::Find => 22,
+            Self::Help => 23,
+            Self::Share => 28,
+            Self::Link => 29,
+            Self::Recycler => 31,
+            Self::RecyclerFull => 32,
+            Self::Lock => 47,
+            Self::DriveUnknown => 58,
+            Self::DriveDvd => 59,
+            Self::Shield => 77,
+            Self::Warning => 78,
+            Self::Info => 79,
+            Self::Error => 80,
+            Self::Key => 81,
+            Self::Software => 82,
+            Self::DesktopPc => 94,
+            Self::MobilePc => 95,
+            Self::Users => 96,
+            Self::Internet => 104,
+            Self::ZipFile => 105,
+            Self::Settings => 106,
+            Self::Custom(v) => v,
         }
     }
 }
 
-/// Extract a system stock icon by ID.
+/// Process-level stock icon cache (stock icons never change).
+type StockCacheMap = Mutex<HashMap<(i32, i32), Arc<IconData>>>;
+
+fn stock_cache() -> &'static StockCacheMap {
+    static CACHE: OnceLock<StockCacheMap> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Extract a system stock icon by ID (system large-icon size).
 pub fn extract_stock_icon(icon: StockIcon) -> Result<IconData, IconError> {
     extract_stock_icon_sized(icon, 0)
 }
 
 /// Extract a system stock icon at a specific size (0 = system default).
-pub fn extract_stock_icon_sized(icon: StockIcon, size: i32) -> Result<IconData, IconError> {
+///
+/// Sizes above the native large icon are GDI-scaled from the stock icon.
+pub fn extract_stock_icon_sized(icon: StockIcon, size: u32) -> Result<IconData, IconError> {
+    let siid = icon.as_i32();
+    let size_key = size.min(256) as i32;
+
+    {
+        let map = stock_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(data) = map.get(&(siid, size_key)) {
+            return Ok((**data).clone());
+        }
+    }
+
+    let data = extract_stock_icon_uncached(icon, size)?;
+    let mut map = stock_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let arc = Arc::new(data);
+    map.insert((siid, size_key), arc.clone());
+    Ok((*arc).clone())
+}
+
+fn extract_stock_icon_uncached(icon: StockIcon, size: u32) -> Result<IconData, IconError> {
     unsafe {
         let flags = SHGSI_ICON | SHGSI_LARGEICON;
         let mut sii = SHSTOCKICONINFO {
@@ -85,7 +140,8 @@ pub fn extract_stock_icon_sized(icon: StockIcon, size: i32) -> Result<IconData, 
 
         let _guard = AutoIcon(sii.hIcon);
         let (w, h) = if size > 0 {
-            (size, size)
+            let s = size.clamp(1, 256) as i32;
+            (s, s)
         } else {
             crate::extract::system_icon_size()
         };

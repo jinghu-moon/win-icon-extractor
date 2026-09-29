@@ -30,13 +30,22 @@ fn main() {
         }
     }
     let raw_serial = t.elapsed();
-    println!("[Raw serial]     {ok}/{} icons, {:?}", paths.len(), raw_serial);
+    println!(
+        "[Raw serial]     {ok}/{} icons, {:?}",
+        paths.len(),
+        raw_serial
+    );
 
     // ── Benchmark 2: Bulk parallel raw extraction ──
     let t = Instant::now();
     let bulk = win_icon_extractor::extract_icons_bulk(&refs);
     let raw_parallel = t.elapsed();
-    println!("[Raw parallel]   {}/{} icons, {:?}", bulk.len(), paths.len(), raw_parallel);
+    println!(
+        "[Raw parallel]   {}/{} icons, {:?}",
+        bulk.len(),
+        paths.len(),
+        raw_parallel
+    );
 
     // ── Benchmark 3: Cache cold start (first run, disk write) ──
     let cache_dir = std::env::temp_dir().join("icon-bench-cache");
@@ -46,30 +55,46 @@ fn main() {
     let t = Instant::now();
     let bulk_cached = cache.extract_to_file_bulk(&refs);
     let cache_cold = t.elapsed();
-    println!("[Cache cold]     {}/{} icons, {:?}", bulk_cached.len(), paths.len(), cache_cold);
+    let ok_cold = bulk_cached.iter().filter(|(_, r)| r.is_ok()).count();
+    println!(
+        "[Cache cold]     {ok_cold}/{} icons, {:?}",
+        paths.len(),
+        cache_cold
+    );
 
-    // ── Benchmark 4: Cache warm (memory hit) ──
+    // ── Benchmark 4: Cache warm (memory hit, TTL = 5s → no stat) ──
     let t = Instant::now();
     for _ in 0..5 {
         let _ = cache.extract_to_file_bulk(&refs);
     }
     let cache_warm = t.elapsed();
-    println!("[Cache warm x5]  {:?}  (avg {:?}/round)", cache_warm, cache_warm / 5);
+    println!(
+        "[Cache warm x5]  {:?}  (avg {:?}/round)",
+        cache_warm,
+        cache_warm / 5
+    );
 
     // ── Benchmark 5: Cache warm single ──
     let t = Instant::now();
     for p in &paths {
-        let _ = cache.extract_to_file(p);
+        let _ = cache.extract_to_file(p).unwrap();
     }
     let cache_single = t.elapsed();
-    println!("[Cache warm seq]  {}/{} icons, {:?}", paths.len(), paths.len(), cache_single);
+    println!(
+        "[Cache warm seq]  {}/{} icons, {:?}  ({:?}/hit)",
+        paths.len(),
+        paths.len(),
+        cache_single,
+        cache_single / paths.len() as u32
+    );
 
     // ── Summary ──
     println!("\n── Summary ──");
     let speedup_parallel = raw_serial.as_micros() as f64 / raw_parallel.as_micros() as f64;
     println!("Parallel vs serial:  {:.1}x", speedup_parallel);
-    let speedup_cache = raw_serial.as_micros() as f64 / cache_warm.as_micros() as f64 * 5.0;
-    println!("Cache warm vs raw:   {:.0}x", speedup_cache);
+    let speedup_cache =
+        raw_serial.as_micros() as f64 / (cache_single.as_micros() as f64 / paths.len() as f64);
+    println!("Cache warm vs raw:   {:.0}x (per-hit)", speedup_cache);
 
     // Cleanup
     let _ = std::fs::remove_dir_all(&cache_dir);

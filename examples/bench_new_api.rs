@@ -12,13 +12,15 @@ fn main() {
     // 1. icon_count
     let t = Instant::now();
     for _ in 0..rounds {
-        let _ = icon_count(r"C:\Windows\System32\shell32.dll");
+        let _ = icon_count(r"C:\Windows\System32\shell32.dll").unwrap();
     }
     let avg = t.elapsed() / rounds;
     println!("[icon_count]     shell32.dll: {:?}/call", avg);
 
     // 2. extract_icon_for_extension
-    let exts = [".pdf", ".docx", ".rs", ".txt", ".zip", ".exe", ".mp3", ".png", ".jpg", ".html"];
+    let exts = [
+        ".pdf", ".docx", ".rs", ".txt", ".zip", ".exe", ".mp3", ".png", ".jpg", ".html",
+    ];
     let t = Instant::now();
     for _ in 0..rounds {
         for ext in &exts {
@@ -27,28 +29,65 @@ fn main() {
     }
     let total_calls = rounds * exts.len() as u32;
     let avg = t.elapsed() / total_calls;
-    println!("[ext_icon]       avg over {total_calls} calls: {:?}/call", avg);
+    println!(
+        "[ext_icon]       avg over {total_calls} calls: {:?}/call",
+        avg
+    );
+
+    // 2b. cached extension icons (process-level memo)
+    #[cfg(feature = "cache")]
+    {
+        let t = Instant::now();
+        for _ in 0..rounds {
+            for ext in &exts {
+                let _ = extract_icon_for_extension_cached(ext, 0);
+            }
+        }
+        let avg = t.elapsed() / total_calls;
+        println!(
+            "[ext_icon cache] avg over {total_calls} calls: {:?}/call",
+            avg
+        );
+    }
 
     // 3. extract_stock_icon
     let stocks = [
-        StockIcon::Folder, StockIcon::DriveFixed, StockIcon::Recycler,
-        StockIcon::Shield, StockIcon::Internet, StockIcon::Warning,
+        StockIcon::Folder,
+        StockIcon::DriveFixed,
+        StockIcon::Recycler,
+        StockIcon::Shield,
+        StockIcon::Internet,
+        StockIcon::Warning,
     ];
     let t = Instant::now();
     for _ in 0..rounds {
         for &id in &stocks {
-            let _ = extract_stock_icon(id);
+            let _ = extract_stock_icon(id).unwrap();
         }
     }
     let total_calls = rounds * stocks.len() as u32;
     let avg = t.elapsed() / total_calls;
-    println!("[stock_icon]     avg over {total_calls} calls: {:?}/call", avg);
+    println!(
+        "[stock_icon]     avg over {total_calls} calls: {:?}/call",
+        avg
+    );
 
     // 4. Comparison: extract_icon (existing file)
     let t = Instant::now();
     for _ in 0..rounds {
-        let _ = extract_icon(r"C:\Windows\explorer.exe");
+        let _ = extract_icon(r"C:\Windows\explorer.exe").unwrap();
     }
     let avg = t.elapsed() / rounds;
     println!("[extract_icon]   explorer.exe: {:?}/call (baseline)", avg);
+
+    // 5. max_size process cache
+    let t = Instant::now();
+    for _ in 0..rounds {
+        let _ = extract_icon(r"C:\Windows\System32\shell32.dll").unwrap();
+    }
+    let avg = t.elapsed() / rounds;
+    println!(
+        "[extract_icon]   shell32.dll: {:?}/call (max_size cached after first)",
+        avg
+    );
 }

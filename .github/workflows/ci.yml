@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check (${{ matrix.os }} / ${{ matrix.features }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest]
+        features:
+          - ""
+          - "webp,cache,bulk,resize"
+          - "webp-libwebp,cache,bulk,resize,png"
+          - "png,cache,bulk,resize"
+          - "webp"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (MSRV 1.70)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.70.0
+
+      - name: cargo check
+        run: cargo check --no-default-features --features "${{ matrix.features }}"
+
+  test:
+    name: test & clippy
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo test (default)
+        run: cargo test --all-features
+
+      - name: cargo test (no default features)
+        run: cargo test --no-default-features
+
+      - name: cargo test (png + cache)
+        run: cargo test --no-default-features --features png,cache,bulk,resize
+
+      - name: cargo doc
+        run: cargo doc --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  examples:
+    name: examples compile
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo check --examples
+        run: cargo check --examples --all-features
